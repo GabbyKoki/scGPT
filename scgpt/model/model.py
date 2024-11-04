@@ -230,6 +230,61 @@ class TransformerModel(nn.Module):
                 "batch_labels should only be provided when `self.use_batch_labels`"
                 " or `self.domain_spec_batchnorm` is True"
             )
+    
+    def get_layer_output(
+        self,
+        src: Tensor,
+        values: Tensor,
+        src_key_padding_mask: Tensor,
+        batch_labels: Optional[Tensor] = None,
+        layer_idx: int = -1
+    ) -> Tensor:
+        """
+        Get the output of a specific layer in the transformer encoder.
+
+        Args:
+            src (Tensor): token ids, shape [batch_size, seq_len]
+            values (Tensor): token values, shape [batch_size, seq_len]
+            src_key_padding_mask (Tensor): mask for src, shape [batch_size, seq_len]
+            batch_labels (Optional[Tensor]): batch labels, shape [batch_size]
+            layer_idx (int): index of the layer to extract output from. 
+                             -1 means the last layer (default).
+
+        Returns:
+            Tensor: output of the specified layer, shape [batch_size, seq_len, d_model]
+        """
+        self._check_batch_labels(batch_labels)
+
+        src = self.encoder(src)  # (batch, seq_len, embsize)
+        self.cur_gene_token_embs = src
+
+        values = self.value_encoder(values)  # (batch, seq_len, embsize)
+        if self.input_emb_style == "scaling":
+            values = values.unsqueeze(2)
+            total_embs = src * values
+        else:
+            total_embs = src + values
+
+        if getattr(self, "dsbn", None) is not None:
+            batch_label = int(batch_labels[0].item())
+            total_embs = self.dsbn(total_embs.permute(0, 2, 1), batch_label).permute(0, 2, 1)
+        elif getattr(self, "bn", None) is not None:
+            total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
+
+        # Access the individual layers of the transformer encoder
+        if isinstance(self.transformer_encoder, TransformerEncoder):
+            for i, layer in enumerate(self.transformer_encoder.layers):
+                total_embs = layer(total_embs, src_key_padding_mask=src_key_padding_mask)
+                if i == layer_idx:
+                    return total_embs
+        elif isinstance(self.transformer_encoder, FastTransformerEncoderWrapper):
+            # For FastTransformerEncoderWrapper, we need to modify its implementation
+            # to allow access to intermediate layer outputs
+            raise NotImplementedError("Layer output extraction not implemented for FastTransformerEncoderWrapper")
+        else:
+            raise ValueError(f"Unsupported transformer_encoder type: {type(self.transformer_encoder)}")
+
+        return total_embs  # Return the last layer if layer_idx is out of range
 
     def generate(
         self,
@@ -438,7 +493,7 @@ class TransformerModel(nn.Module):
             output["dab_output"] = self.grad_reverse_discriminator(cell_emb)
 
         return output
-
+    
     def encode_batch(
         self,
         src: Tensor,
